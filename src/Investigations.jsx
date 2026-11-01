@@ -1,72 +1,65 @@
 import { useEffect, useState } from 'react'
+import { getAlerts } from './api/alerts.js'
+import { createInvestigation, getInvestigationStats, getInvestigations } from './api/investigations.js'
+import { InvestigationGraphPanel } from './LinkedAccounts.jsx'
 
 const STATUS_TABS = ['All', 'Open', 'Under review', 'Closed']
-const CASES_STORAGE_KEY = 'underlock.investigations.cases'
+const PAGE_SIZE = 25
 
-function readStoredCases() {
-  if (typeof window === 'undefined') return []
-  try {
-    const storedCases = JSON.parse(window.localStorage.getItem(CASES_STORAGE_KEY) ?? '[]')
-    return Array.isArray(storedCases) ? storedCases : []
-  } catch {
-    return []
-  }
+function apiStatus(status) {
+  return status === 'All' ? undefined : status.toLowerCase().replaceAll(' ', '_')
 }
 
-export function useInvestigations() {
-  // TODO: replace browser-local cases with the investigations API.
-  const [cases, setCases] = useState(readStoredCases)
-  const [page, setPage] = useState(1)
-  const [summary, setSummary] = useState({
-    totalCases: 128,
-    averageResolutionSeconds: 0,
-    resolutionTargetMinutes: 0,
-  })
+function displayStatus(status) {
+  return status === 'under_review' ? 'Under review' : status.charAt(0).toUpperCase() + status.slice(1)
+}
+
+function formatDuration(seconds) {
+  if (!seconds) return '0s'
+  const minutes = Math.floor(seconds / 60)
+  const remainder = Math.round(seconds % 60)
+  return minutes ? `${minutes}m ${remainder}s` : `${remainder}s`
+}
+
+export function useInvestigations({ status, search, page, reloadKey, enabled = true }) {
+  const [result, setResult] = useState({ items: [], total: 0 })
+  const [kpis, setKpis] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(CASES_STORAGE_KEY, JSON.stringify(cases))
-    } catch {
-      // Keep in-memory creation working when browser storage is unavailable.
-    }
-  }, [cases])
+    if (!enabled) return undefined
+    const controller = new AbortController()
+    getInvestigations({
+      status: apiStatus(status),
+      search,
+      page,
+      pageSize: PAGE_SIZE,
+    }, { signal: controller.signal })
+      .then(setResult)
+      .catch((requestError) => {
+        if (requestError.name !== 'AbortError') setError(requestError.message || 'Unable to load investigations.')
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false)
+      })
+    setLoading(true)
+    setError('')
+    return () => controller.abort()
+  }, [status, search, page, reloadKey, enabled])
 
-  const pageSize = 10
-  const openCount = cases.filter((caseItem) => caseItem.status === 'Open').length
-  const myQueueCount = cases.filter((caseItem) => caseItem.assignedAnalystId === 'AN-8902').length
-  const createCase = (title) => {
-    const now = new Date().toISOString()
-    const newCase = {
-      id: `INV-${now.slice(0, 4)}-${String(Date.now()).slice(-6)}`,
-      title: title.trim(),
-      linkedAlerts: 0,
-      combinedExposure: 0,
-      status: 'Open',
-      assignedAnalyst: 'AN-8902',
-      assignedAnalystId: 'AN-8902',
-      lastActivity: now,
-      identifiers: [],
-    }
-    setCases((currentCases) => [newCase, ...currentCases])
-    return newCase
-  }
+  useEffect(() => {
+    if (!enabled) return undefined
+    const controller = new AbortController()
+    getInvestigationStats({ signal: controller.signal })
+      .then(setKpis)
+      .catch((requestError) => {
+        if (requestError.name !== 'AbortError') setError(requestError.message || 'Unable to load investigation stats.')
+      })
+    return () => controller.abort()
+  }, [reloadKey, enabled])
 
-  return {
-    cases,
-    createCase,
-    page,
-    setPage,
-    pageSize,
-    setCases,
-    setSummary,
-    kpis: {
-      openCount,
-      totalCount: summary.totalCases + cases.length,
-      myQueueCount,
-      averageResolutionSeconds: summary.averageResolutionSeconds,
-      resolutionTargetMinutes: summary.resolutionTargetMinutes,
-    },
-  }
+  return { cases: result.items, total: result.total, pageSize: PAGE_SIZE, kpis, loading, error }
 }
 
 function PageHeader() {
@@ -79,9 +72,9 @@ function PageHeader() {
 
 function KpiStrip({ kpis }) {
   const metrics = [
-    { label: 'OPEN CASES', value: kpis.openCount, suffix: `/ ${kpis.totalCount} total` },
-    { label: 'CASES ASSIGNED TO ME', value: kpis.myQueueCount ? kpis.myQueueCount : 'Nil', suffix: 'active queue' },
-    { label: 'AVG. CASE RESOLUTION TIME', value: `${kpis.averageResolutionSeconds}s`, suffix: `target < ${kpis.resolutionTargetMinutes}m` },
+    { label: 'OPEN CASES', value: kpis?.open_count ?? '—', suffix: `/ ${kpis?.total_count ?? '—'} total` },
+    { label: 'CASES ASSIGNED TO ME', value: kpis?.assigned_to_me ?? '—', suffix: 'active queue' },
+    { label: 'AVG. CASE RESOLUTION TIME', value: kpis ? formatDuration(kpis.avg_resolution_time_seconds) : '—', suffix: 'average' },
   ]
 
   return (
@@ -96,14 +89,7 @@ function KpiStrip({ kpis }) {
   )
 }
 
-function CasesToolbar({ cases, query, onQueryChange, status, onStatusChange, onNewCase }) {
-  const counts = {
-    All: cases.length,
-    Open: cases.filter((caseItem) => caseItem.status === 'Open').length,
-    'Under review': cases.filter((caseItem) => caseItem.status === 'Under review').length,
-    Closed: cases.filter((caseItem) => caseItem.status === 'Closed').length,
-  }
-
+function CasesToolbar({ query, onQueryChange, status, onStatusChange, onNewCase }) {
   return (
     <div className="investigations-toolbar">
       <label className="investigations-filter-input">
@@ -111,14 +97,14 @@ function CasesToolbar({ cases, query, onQueryChange, status, onStatusChange, onN
         <input
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
-          placeholder="Filter cases, entities, identifiers..."
-          aria-label="Filter cases, entities, identifiers"
+          placeholder="Search case ID or title..."
+          aria-label="Search case ID or title"
         />
       </label>
       <div className="transactions-segmented investigations-segmented" aria-label="Filter cases by status">
         {STATUS_TABS.map((tab) => (
           <button key={tab} type="button" aria-pressed={status === tab} onClick={() => onStatusChange(tab)}>
-            {tab} ({counts[tab]})
+            {tab}
           </button>
         ))}
       </div>
@@ -130,8 +116,9 @@ function CasesToolbar({ cases, query, onQueryChange, status, onStatusChange, onN
 }
 
 function formatExposure(value) {
-  if (typeof value !== 'number') return value ?? '$0'
-  return `$${value.toLocaleString('en-US', { maximumFractionDigits: 0 })}`
+  const amount = Number(value)
+  if (!Number.isFinite(amount)) return '$0'
+  return `$${amount.toLocaleString('en-US', { maximumFractionDigits: 0 })}`
 }
 
 function relativeActivity(value) {
@@ -186,13 +173,13 @@ function CasesTable({ cases, onOpenCase, onOpenLinkedAccounts }) {
                   }
                 }}
               >
-                <td className="case-id-cell">{caseItem.id}</td>
+                <td className="case-id-cell">{caseItem.case_code}</td>
                 <td className="case-title-cell">{caseItem.title}</td>
-                <td className="case-number-cell">{caseItem.linkedAlerts ?? 0}</td>
-                <td className="case-number-cell">{formatExposure(caseItem.combinedExposure)}</td>
-                <td><span className={`case-status-badge case-status-${String(caseItem.status).toLowerCase().replaceAll(' ', '-')}`}>{caseItem.status}</span></td>
-                <td>{caseItem.assignedAnalyst ?? '--'}</td>
-                <td className="case-time-cell">{relativeActivity(caseItem.lastActivity)}</td>
+                <td className="case-number-cell">{caseItem.linked_alerts ?? 0}</td>
+                <td className="case-number-cell">{formatExposure(caseItem.combined_exposure)}</td>
+                <td><span className={`case-status-badge case-status-${caseItem.status.replaceAll('_', '-')}`}>{displayStatus(caseItem.status)}</span></td>
+                <td>{caseItem.assignee?.analyst_code ?? caseItem.assignee?.name ?? '--'}</td>
+                <td className="case-time-cell">{relativeActivity(caseItem.last_activity)}</td>
                 <td className="case-actions-cell">
                   <button
                     type="button"
@@ -238,12 +225,38 @@ function TablePagination({ page, pageCount, totalCount, pageSize, onPageChange }
 
 function NewCaseModal({ onClose, onCreateCase }) {
   const [title, setTitle] = useState('')
+  const [alerts, setAlerts] = useState([])
+  const [selectedAlertIds, setSelectedAlertIds] = useState([])
+  const [loadingAlerts, setLoadingAlerts] = useState(true)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
 
-  function handleSubmit(event) {
+  useEffect(() => {
+    const controller = new AbortController()
+    getAlerts({ status: null, page: 1, pageSize: 100 }, { signal: controller.signal })
+      .then((response) => setAlerts(response.items))
+      .catch((requestError) => {
+        if (requestError.name !== 'AbortError') setError(requestError.message || 'Unable to load alerts.')
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingAlerts(false)
+      })
+    return () => controller.abort()
+  }, [])
+
+  async function handleSubmit(event) {
     event.preventDefault()
     const normalizedTitle = title.trim()
-    if (!normalizedTitle) return
-    onCreateCase(normalizedTitle)
+    if (!normalizedTitle || !selectedAlertIds.length || submitting) return
+    setSubmitting(true)
+    setError('')
+    try {
+      await onCreateCase(normalizedTitle, selectedAlertIds)
+    } catch (requestError) {
+      setError(requestError.message || 'Unable to create case.')
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -256,9 +269,29 @@ function NewCaseModal({ onClose, onCreateCase }) {
         <form onSubmit={handleSubmit}>
           <label htmlFor="new-case-name">Case title</label>
           <input id="new-case-name" value={title} onChange={(event) => setTitle(event.target.value)} autoFocus required />
+          <fieldset className="investigations-alert-picker">
+            <legend>Alerts to link</legend>
+            {loadingAlerts ? <p>Loading alerts…</p> : alerts.length ? alerts.map((alert) => (
+              <label key={alert.id}>
+                <input
+                  type="checkbox"
+                  checked={selectedAlertIds.includes(alert.id)}
+                  onChange={(event) => {
+                    setSelectedAlertIds((current) => event.target.checked
+                      ? [...current, alert.id]
+                      : current.filter((alertId) => alertId !== alert.id))
+                  }}
+                />
+                <span>{alert.priority || alert.rule_key || alert.source} · risk {alert.risk_score} · {alert.status}</span>
+              </label>
+            )) : <p>No alerts available to link.</p>}
+          </fieldset>
+          {error && <p className="investigations-modal-error" role="alert">{error}</p>}
           <div className="investigations-modal-actions">
             <button className="transactions-export-button" type="button" onClick={onClose}>Cancel</button>
-            <button className="transactions-export-button investigations-new-case" type="submit">Create case</button>
+            <button className="transactions-export-button investigations-new-case" type="submit" disabled={submitting || loadingAlerts || !selectedAlertIds.length}>
+              {submitting ? 'Creating…' : `Create case${selectedAlertIds.length ? ` (${selectedAlertIds.length})` : ''}`}
+            </button>
           </div>
         </form>
       </section>
@@ -272,24 +305,32 @@ function CaseDetailStub({ caseId, onBack, onOpenLinkedAccounts }) {
       <button className="transactions-export-button" type="button" onClick={onBack}>&lt; Back to cases</button>
       <button className="transactions-export-button linked-account-case-link" type="button" onClick={() => onOpenLinkedAccounts(caseId)}>Linked accounts</button>
       <h1>Case {caseId}</h1>
-      <p>Case details are not connected yet.</p>
+      <InvestigationGraphPanel caseId={caseId} />
     </div>
   )
 }
 
 export default function InvestigationsPage({ caseId, onOpenCase, onBackToCases, onOpenLinkedAccounts }) {
-  const { cases, createCase, page, setPage, pageSize, kpis } = useInvestigations()
+  const [page, setPage] = useState(1)
   const [query, setQuery] = useState('')
+  const [search, setSearch] = useState('')
   const [status, setStatus] = useState('All')
   const [newCaseOpen, setNewCaseOpen] = useState(false)
-  const normalizedQuery = query.trim().toLowerCase()
-  const filteredCases = cases.filter((caseItem) => {
-    if (status !== 'All' && caseItem.status !== status) return false
-    const searchable = [caseItem.id, caseItem.title, caseItem.entity, ...(caseItem.identifiers ?? [])].join(' ').toLowerCase()
-    return searchable.includes(normalizedQuery)
+  const [reloadKey, setReloadKey] = useState(0)
+  const { cases, total, pageSize, kpis, loading, error } = useInvestigations({
+    status,
+    search,
+    page,
+    reloadKey,
+    enabled: !caseId,
   })
-  const pageCount = Math.ceil(filteredCases.length / pageSize)
-  const pageCases = filteredCases.slice((page - 1) * pageSize, page * pageSize)
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => setSearch(query.trim()), 250)
+    return () => window.clearTimeout(timeoutId)
+  }, [query])
+
+  const pageCount = Math.ceil(total / pageSize)
 
   if (caseId) return <main className="transactions-page investigations-page"><CaseDetailStub caseId={caseId} onBack={onBackToCases} onOpenLinkedAccounts={onOpenLinkedAccounts} /></main>
 
@@ -303,11 +344,13 @@ export default function InvestigationsPage({ caseId, onOpenCase, onBackToCases, 
     setPage(1)
   }
 
-  function handleCreateCase(title) {
-    createCase(title)
+  async function handleCreateCase(title, alertIds) {
+    await createInvestigation({ title, alert_ids: alertIds })
     setQuery('')
+    setSearch('')
     setStatus('All')
     setPage(1)
+    setReloadKey((current) => current + 1)
     setNewCaseOpen(false)
   }
 
@@ -315,10 +358,13 @@ export default function InvestigationsPage({ caseId, onOpenCase, onBackToCases, 
     <main className="transactions-page investigations-page">
       <PageHeader />
       <KpiStrip kpis={kpis} />
-      <CasesToolbar cases={cases} query={query} onQueryChange={updateQuery} status={status} onStatusChange={updateStatus} onNewCase={() => setNewCaseOpen(true)} />
+      <CasesToolbar query={query} onQueryChange={updateQuery} status={status} onStatusChange={updateStatus} onNewCase={() => setNewCaseOpen(true)} />
+      {error && <p className="investigations-request-error" role="alert">{error}</p>}
       <section className="investigations-table-section" aria-label="Cases">
-        <CasesTable cases={pageCases} onOpenCase={onOpenCase} onOpenLinkedAccounts={onOpenLinkedAccounts} />
-        <TablePagination page={page} pageCount={pageCount} totalCount={filteredCases.length} pageSize={pageSize} onPageChange={setPage} />
+        {loading && !cases.length
+          ? <p className="investigations-loading" role="status">Loading investigations…</p>
+          : <CasesTable cases={cases} onOpenCase={onOpenCase} onOpenLinkedAccounts={onOpenLinkedAccounts} />}
+        <TablePagination page={page} pageCount={pageCount} totalCount={total} pageSize={pageSize} onPageChange={setPage} />
       </section>
       {newCaseOpen && <NewCaseModal onClose={() => setNewCaseOpen(false)} onCreateCase={handleCreateCase} />}
     </main>

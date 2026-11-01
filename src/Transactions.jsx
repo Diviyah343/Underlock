@@ -1,79 +1,188 @@
 import { useEffect, useRef, useState } from 'react'
+import { exportTransactions, getTransactionMetrics, getTransactions } from './api/transactions.js'
+import { openEventStream } from './api/sse.js'
 
 const WINDOWS = {
-  'Last 24h': { duration: 24 * 60 * 60 * 1000, labels: ['00:00', '04:00', '08:00', '12:00', '16:00', '20:00', 'NOW'] },
-  '1h': { duration: 60 * 60 * 1000, labels: ['-60m', '-50m', '-40m', '-30m', '-20m', '-10m', 'NOW'] },
-  Live: { duration: 60 * 1000, labels: ['-60s', '-50s', '-40s', '-30s', '-20s', '-10s', 'NOW'] },
+  'Last 24h': { apiRange: '24h', label: 'Last 24h' },
+  '1h': { apiRange: '1h', label: '1h' },
+  Live: { apiRange: 'live', label: 'Live' },
 }
 
-export function useTransactionStream() {
-  const [transactions, setTransactions] = useState([])
-  const [threshold, setThreshold] = useState(0.45)
+function displayStatus(status) {
+  return status ? `${status[0].toUpperCase()}${status.slice(1)}` : 'Unknown'
+}
 
-  // Plug a WebSocket, SSE, or polling source into this hook when the feed is available.
-  const now = Date.now()
-  const recentTransactions = transactions.filter((transaction) => now - new Date(transaction.timestamp).getTime() <= 1000)
-  const flaggedTransactions = transactions.filter((transaction) => transaction.status === 'Flagged')
-  const fraudAverage = transactions.length ? (flaggedTransactions.length / transactions.length) * 100 : 0
-  const hourlyFraud = new Map()
-  transactions.forEach((transaction) => {
-    const hour = Math.floor(new Date(transaction.timestamp).getTime() / (60 * 60 * 1000))
-    const totals = hourlyFraud.get(hour) ?? { count: 0, flagged: 0 }
-    totals.count += 1
-    if (transaction.status === 'Flagged') totals.flagged += 1
-    hourlyFraud.set(hour, totals)
-  })
-  const fraudPeak = Math.max(0, ...Array.from(hourlyFraud.values(), (totals) => (totals.flagged / totals.count) * 100))
-  const currentHour = Math.floor(now / (60 * 60 * 1000))
-  const historicalHours = Array.from(hourlyFraud.entries()).filter(([hour]) => hour !== currentHour).map(([, totals]) => totals.count)
-  const hourlyMean = historicalHours.length ? historicalHours.reduce((sum, count) => sum + count, 0) / historicalHours.length : 0
-  const currentHourCount = hourlyFraud.get(currentHour)?.count ?? 0
-  const volumeChange = hourlyMean ? ((currentHourCount - hourlyMean) / hourlyMean) * 100 : 0
-  const pushTransactions = (incoming) => {
-    const updates = Array.isArray(incoming) ? incoming : [incoming]
-    setTransactions((current) => [...current, ...updates].slice(-100))
+function chartLabels(series) {
+  if (series.length <= 7) {
+    return series.map((point, index) => index === series.length - 1
+      ? 'NOW'
+      : new Date(point.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))
   }
+  const labels = []
+  for (let index = 0; index < 7; index += 1) {
+    const pointIndex = Math.round((index * (series.length - 1)) / 6)
+    labels.push(index === 6
+      ? 'NOW'
+      : new Date(series[pointIndex].timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))
+  }
+  return labels
+}
+
+function volumeAxis(maxValue) {
+  const safeMax = maxValue > 0 ? maxValue : 1
+  const step = safeMax / 3
+  return {
+    maxValue: safeMax,
+    yTicks: Array.from({ length: 4 }, (_, index) => {
+      const value = step * index
+      return {
+        value,
+        label: value >= 1000000
+          ? `${(value / 1000000).toFixed(1)}m`
+          : value >= 1000
+            ? `${(value / 1000).toFixed(1)}k`
+            : value.toFixed(0),
+      }
+    }),
+  }
+}
+
+function fraudAxis(maxValue) {
+  const safeMax = maxValue > 0 ? maxValue : 1
+  const step = safeMax / 3
+  return {
+    maxValue: safeMax,
+    yTicks: Array.from({ length: 4 }, (_, index) => {
+      const value = step * index
+      return { value, label: `${value.toFixed(2)}%` }
+    }),
+  }
+}
+
+function mapTransaction(transaction) {
+  return {
+    ...transaction,
+    display_status: displayStatus(transaction.status),
+  }
+}
+
+export function useTransactionStream({ period, query, status, paused }) {
+  const [transactions, setTransactions] = useState([])
+  const [statusCounts, setStatusCounts] = useState({ cleared: 0, review: 0, flagged: 0 })
+  const [metrics, setMetrics] = useState({
+    throughput_tx_s: 0,
+    total_count: 0,
+    volume_series: [],
+    fraud_rate_series: [],
+    fraud_rate_threshold: 0.05,
+  })
+  const [error, setError] = useState('')
+  const [debouncedQuery, setDebouncedQuery] = useState(query)
+  const refreshTransactionsRef = useRef(() => {})
+  const refreshMetricsRef = useRef(() => {})
+  const refreshTimerRef = useRef(null)
+  const pausedRef = useRef(paused)
+
+  useEffect(() => {
+    pausedRef.current = paused
+  }, [paused])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQuery(query), 300)
+    return () => window.clearTimeout(timer)
+  }, [query])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    refreshTransactionsRef.current = async () => {
+      const page = await getTransactions({
+        search: debouncedQuery,
+        status,
+        limit: 100,
+        offset: 0,
+      }, { signal: controller.signal })
+      setTransactions(page.items.map(mapTransaction))
+      setStatusCounts(page.status_counts)
+      setError('')
+    }
+
+    void refreshTransactionsRef.current().catch((loadError) => {
+      if (loadError.name !== 'AbortError') setError(loadError.message || 'Unable to load transactions.')
+    })
+
+    return () => controller.abort()
+  }, [debouncedQuery, status])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    refreshMetricsRef.current = async () => {
+      const result = await getTransactionMetrics(WINDOWS[period].apiRange, 0.05, {
+        signal: controller.signal,
+      })
+      setMetrics(result)
+    }
+    void refreshMetricsRef.current().catch((loadError) => {
+      if (loadError.name !== 'AbortError') setError(loadError.message || 'Unable to load transaction metrics.')
+    })
+    return () => controller.abort()
+  }, [period])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const stream = openEventStream('/transactions/stream', {
+      onEvent(event) {
+        if (event.event !== 'transaction') return
+        if (pausedRef.current) return
+        window.clearTimeout(refreshTimerRef.current)
+        refreshTimerRef.current = window.setTimeout(() => {
+          void refreshTransactionsRef.current().catch((loadError) => {
+            if (loadError.name !== 'AbortError') setError(loadError.message || 'Unable to refresh transactions.')
+          })
+          void refreshMetricsRef.current().catch((loadError) => {
+            if (loadError.name !== 'AbortError') setError(loadError.message || 'Unable to refresh metrics.')
+          })
+        }, 250)
+      },
+      onError(streamError) {
+        setError(streamError.message || 'Transaction stream disconnected.')
+      },
+      signal: controller.signal,
+    })
+    return () => {
+      stream.close()
+      controller.abort()
+      window.clearTimeout(refreshTimerRef.current)
+    }
+  }, [])
+
+  const fraudRates = metrics.fraud_rate_series.map((point) => point.fraud_rate * 100)
+  const volumeValues = metrics.volume_series.map((point) => Number(point.volume))
 
   return {
-    transactions: transactions.slice(-100),
+    transactions,
+    statusCounts,
     metrics: {
-      throughput: recentTransactions.length,
-      volume: transactions.length,
-      volumeChange,
-      fraudAverage,
-      fraudPeak,
-      threshold,
+      throughput: metrics.throughput_tx_s,
+      volume: metrics.total_count,
+      volumeSeries: volumeValues,
+      volumeLabels: chartLabels(metrics.volume_series),
+      volumePeak: Math.max(0, ...volumeValues),
+      fraudAverage: fraudRates.length
+        ? fraudRates.reduce((total, value) => total + value, 0) / fraudRates.length
+        : 0,
+      fraudPeak: Math.max(0, ...fraudRates),
+      fraudSeries: fraudRates,
+      fraudLabels: chartLabels(metrics.fraud_rate_series),
+      threshold: metrics.fraud_rate_threshold * 100,
+      error,
     },
-    pushTransactions,
-    setThreshold,
+    refreshTransactions: () => refreshTransactionsRef.current(),
   }
 }
 
 function formatCount(value) {
   const padded = String(value).padStart(8, '0')
   return `${padded.replace(/\B(?=(\d{3})+(?!\d))/g, ',')} tx`
-}
-
-function seriesFor(transactions, period, metric) {
-  const window = WINDOWS[period]
-  const now = Date.now()
-  const inWindow = transactions.filter((transaction) => {
-    const age = now - new Date(transaction.timestamp).getTime()
-    return age >= 0 && age <= window.duration
-  })
-  if (!inWindow.length) return []
-  const buckets = Array.from({ length: window.labels.length }, () => ({ count: 0, flagged: 0 }))
-
-  inWindow.forEach((transaction) => {
-    const age = now - new Date(transaction.timestamp).getTime()
-    const index = Math.min(buckets.length - 1, Math.floor(((window.duration - age) / window.duration) * buckets.length))
-    buckets[index].count += 1
-    if (transaction.status === 'Flagged') buckets[index].flagged += 1
-  })
-
-  return buckets.map((bucket) => metric === 'volume'
-    ? bucket.count
-    : (bucket.count ? (bucket.flagged / bucket.count) * 100 : 0))
 }
 
 function PageHeader({ period, onPeriodChange, throughput, paused }) {
@@ -87,12 +196,12 @@ function PageHeader({ period, onPeriodChange, throughput, paused }) {
         </span>
       </div>
       <div className="transactions-header-tools">
-        <span className="transactions-throughput">Throughput: {throughput} tx/s</span>
+        <span className="transactions-throughput">Throughput: {Number(throughput).toFixed(2)} tx/s</span>
         <span className="transactions-header-divider" aria-hidden="true" />
         <div className="transactions-segmented" aria-label="Chart time range">
           {Object.keys(WINDOWS).map((option) => (
             <button key={option} type="button" aria-pressed={period === option} onClick={() => onPeriodChange(option)}>
-              {option === 'Last 24h' ? 'Last 24h' : option}
+              {WINDOWS[option].label}
             </button>
           ))}
         </div>
@@ -107,18 +216,19 @@ function ChartSvg({ title, values, labels, yTicks, maxValue, threshold, emptyMar
   const plot = { left: 72, right: 786, top: 18, bottom: 218 }
   const plotWidth = plot.right - plot.left
   const plotHeight = plot.bottom - plot.top
+  const chartMax = maxValue > 0 ? maxValue : 1
   const points = values.map((value, index) => ({
     x: plot.left + (plotWidth * index) / Math.max(values.length - 1, 1),
-    y: plot.bottom - (Math.min(value, maxValue) / maxValue) * plotHeight,
+    y: plot.bottom - (Math.min(value, chartMax) / chartMax) * plotHeight,
   }))
   const linePath = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`).join(' ')
-  const markerY = plot.bottom - (Math.min(emptyMarker, maxValue) / maxValue) * plotHeight
-  const thresholdY = plot.bottom - (threshold / maxValue) * plotHeight
+  const markerY = plot.bottom - (Math.min(emptyMarker, chartMax) / chartMax) * plotHeight
+  const thresholdY = plot.bottom - (Math.min(threshold, chartMax) / chartMax) * plotHeight
 
   return (
     <svg className="transactions-chart-svg" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label={title}>
       {yTicks.map((tick) => {
-        const y = plot.bottom - (tick.value / maxValue) * plotHeight
+        const y = plot.bottom - (tick.value / chartMax) * plotHeight
         return (
           <g key={tick.label}>
             <line className={tick.value === 0 ? 'chart-baseline' : 'chart-gridline'} x1={plot.left} x2={plot.right} y1={y} y2={y} />
@@ -145,7 +255,7 @@ function ChartSvg({ title, values, labels, yTicks, maxValue, threshold, emptyMar
   )
 }
 
-function MetricCard({ title, subtitle, value, detail, series, period, yTicks, maxValue, threshold, emptyMarker, chartTitle }) {
+function MetricCard({ title, subtitle, value, detail, series, labels, yTicks, maxValue, threshold, emptyMarker, chartTitle }) {
   return (
     <article className="transactions-metric-card">
       <div className="transactions-metric-heading">
@@ -161,7 +271,7 @@ function MetricCard({ title, subtitle, value, detail, series, period, yTicks, ma
       <ChartSvg
         title={chartTitle}
         values={series}
-        labels={WINDOWS[period].labels}
+        labels={labels}
         yTicks={yTicks}
         maxValue={maxValue}
         threshold={threshold}
@@ -171,38 +281,19 @@ function MetricCard({ title, subtitle, value, detail, series, period, yTicks, ma
   )
 }
 
-function FilterBar({ transactions, query, onQueryChange, segment, onSegmentChange, filteredRows }) {
+function FilterBar({ query, onQueryChange, segment, onSegmentChange, statusCounts, onExport }) {
   const counts = {
-    all: transactions.length,
-    review: transactions.filter((transaction) => transaction.status === 'Review').length,
-    flagged: transactions.filter((transaction) => transaction.status === 'Flagged').length,
+    all: Object.values(statusCounts).reduce((total, count) => total + count, 0),
+    cleared: statusCounts.cleared ?? 0,
+    review: statusCounts.review ?? 0,
+    flagged: statusCounts.flagged ?? 0,
   }
   const tabs = [
     { label: `All (${counts.all})`, value: 'All' },
-    { label: `Review (${counts.review})`, value: 'Review' },
-    { label: `Flagged (${counts.flagged})`, value: 'Flagged' },
+    { label: `Cleared (${counts.cleared})`, value: 'cleared' },
+    { label: `Review (${counts.review})`, value: 'review' },
+    { label: `Flagged (${counts.flagged})`, value: 'flagged' },
   ]
-
-  function exportCsv() {
-    const columns = ['Time', 'Tx hash', 'Account', 'Amount', 'Jurisdiction', 'Risk score', 'Status']
-    const escape = (value) => `"${String(value ?? '').replaceAll('"', '""')}"`
-    const rows = filteredRows.map((transaction) => [
-      transaction.timestamp,
-      transaction.hash,
-      transaction.account,
-      `${transaction.amount} ${transaction.currency ?? ''}`.trim(),
-      transaction.jurisdiction,
-      transaction.riskScore,
-      transaction.status,
-    ])
-    const csv = [columns, ...rows].map((row) => row.map(escape).join(',')).join('\r\n')
-    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
-    const link = document.createElement('a')
-    link.href = url
-    link.download = 'transactions.csv'
-    link.click()
-    URL.revokeObjectURL(url)
-  }
 
   return (
     <div className="transactions-filter-bar">
@@ -218,7 +309,7 @@ function FilterBar({ transactions, query, onQueryChange, segment, onSegmentChang
             </button>
           ))}
         </div>
-        <button className="transactions-export-button" type="button" onClick={exportCsv}>Export CSV</button>
+        <button className="transactions-export-button" type="button" onClick={onExport}>Export CSV</button>
       </div>
     </div>
   )
@@ -252,14 +343,14 @@ function TransactionTable({ rows, scrollRef }) {
         </thead>
         <tbody>
           {rows.length ? rows.map((transaction, index) => (
-            <tr key={transaction.id ?? transaction.hash ?? index} className={`transaction-row-${String(transaction.status).toLowerCase()}`}>
-              <td>{transaction.timestamp}</td>
-              <td>{transaction.hash}</td>
-              <td>{transaction.account}</td>
+            <tr key={transaction.id ?? index} className={`transaction-row-${transaction.status}`}>
+              <td>{new Date(transaction.occurred_at).toLocaleString()}</td>
+              <td>{transaction.tx_hash}</td>
+              <td>{transaction.account_id}</td>
               <td>{transaction.amount} {transaction.currency}</td>
               <td>{transaction.jurisdiction}</td>
-              <td>{transaction.riskScore}</td>
-              <td><span className={`transaction-status transaction-status-${String(transaction.status).toLowerCase()}`}>{transaction.status}</span></td>
+              <td>{transaction.risk_score ?? '—'}</td>
+              <td><span className={`transaction-status transaction-status-${transaction.status}`}>{transaction.display_status}</span></td>
             </tr>
           )) : (
             <tr className="transactions-empty-row">
@@ -273,66 +364,98 @@ function TransactionTable({ rows, scrollRef }) {
 }
 
 export default function TransactionsPage() {
-  const { transactions, metrics } = useTransactionStream()
   const [period, setPeriod] = useState('Last 24h')
   const [query, setQuery] = useState('')
   const [segment, setSegment] = useState('All')
   const [paused, setPaused] = useState(false)
+  const [exportError, setExportError] = useState('')
   const tableScrollRef = useRef(null)
-  const reviewCount = transactions.filter((transaction) => transaction.status === 'Review').length
-  const flaggedCount = transactions.filter((transaction) => transaction.status === 'Flagged').length
-  const rows = transactions.filter((transaction) => {
-    if (segment !== 'All' && transaction.status !== segment) return false
-    const searchable = [transaction.hash, transaction.account, transaction.jurisdiction].join(' ').toLowerCase()
-    return searchable.includes(query.trim().toLowerCase())
-  }).slice(-100)
+  const selectedStatus = segment === 'All' ? undefined : segment
+  const {
+    transactions,
+    statusCounts,
+    metrics,
+    refreshTransactions,
+  } = useTransactionStream({ period, query, status: selectedStatus, paused })
+  const rows = transactions
 
   function jumpToLatest() {
     setPaused(false)
+    void refreshTransactions().catch((error) => setExportError(error.message || 'Unable to refresh transactions.'))
     const scrollArea = tableScrollRef.current
-    if (scrollArea) scrollArea.scrollTop = scrollArea.scrollHeight
+    if (scrollArea) scrollArea.scrollTop = 0
+  }
+
+  function togglePaused() {
+    if (paused) {
+      void refreshTransactions().catch((error) => {
+        setExportError(error.message || 'Unable to refresh transactions.')
+      })
+    }
+    setPaused(!paused)
   }
 
   useEffect(() => {
     if (!paused && tableScrollRef.current) {
-      tableScrollRef.current.scrollTop = tableScrollRef.current.scrollHeight
+      tableScrollRef.current.scrollTop = 0
     }
   }, [paused, transactions])
+
+  async function handleExport() {
+    setExportError('')
+    try {
+      await exportTransactions({ search: query, status: selectedStatus })
+    } catch (error) {
+      setExportError(error.message || 'Unable to export transactions.')
+    }
+  }
+
+  const volumeChart = volumeAxis(metrics.volumePeak * 1.1)
+  const fraudChart = fraudAxis(Math.max(metrics.fraudPeak, metrics.threshold) * 1.1)
 
   return (
     <div className="transactions-page">
       <PageHeader period={period} onPeriodChange={setPeriod} throughput={metrics.throughput} paused={paused} />
       <section className="transactions-metrics-grid" aria-label="Transaction metrics">
         <MetricCard
-          title="Transaction volume (24h)"
-          subtitle="Aggregate processed counter"
+          title={`Transaction volume (${WINDOWS[period].label})`}
+          subtitle="Aggregate transaction amount"
           value={formatCount(metrics.volume)}
-          detail={`${metrics.volumeChange >= 0 ? '+' : ''}${metrics.volumeChange.toFixed(1)}% vs mean`}
-          series={seriesFor(transactions, period, 'volume')}
-          period={period}
-          yTicks={[{ value: 0, label: '0' }, { value: 5000, label: '5k' }, { value: 10000, label: '10k' }, { value: 15000, label: '15k' }]}
-          maxValue={15000}
-          emptyMarker={12000}
+          detail={`Peak ${metrics.volumePeak.toLocaleString(undefined, { maximumFractionDigits: 0 })}`}
+          series={metrics.volumeSeries}
+          labels={metrics.volumeLabels}
+          yTicks={volumeChart.yTicks}
+          maxValue={volumeChart.maxValue}
+          emptyMarker={metrics.volumePeak}
           chartTitle="Transaction volume over time"
         />
         <MetricCard
-          title="Fraud rate (%) (24h)"
+          title={`Fraud rate (%) (${WINDOWS[period].label})`}
           subtitle={`Threshold benchmark: ${metrics.threshold.toFixed(2)}%`}
           value={`${metrics.fraudAverage.toFixed(2)}% avg`}
           detail={`Peak ${metrics.fraudPeak.toFixed(2)}%`}
-          series={seriesFor(transactions, period, 'fraud')}
-          period={period}
-          yTicks={[{ value: 0, label: '0.0%' }, { value: 0.2, label: '0.2%' }, { value: 0.4, label: '0.4%' }, { value: 0.6, label: '0.6%' }]}
-          maxValue={0.6}
+          series={metrics.fraudSeries}
+          labels={metrics.fraudLabels}
+          yTicks={fraudChart.yTicks}
+          maxValue={fraudChart.maxValue}
           threshold={metrics.threshold}
           emptyMarker={0}
           chartTitle="Fraud rate over time"
         />
       </section>
-      <FilterBar transactions={transactions} query={query} onQueryChange={setQuery} segment={segment} onSegmentChange={setSegment} filteredRows={rows} />
-      <FeedStatusBar paused={paused} onTogglePaused={() => setPaused((value) => !value)} onJumpToLatest={jumpToLatest} />
+      {metrics.error && <p className="px-[12px] py-[6px] font-mono text-[9px] text-[#9b3f3f]" role="alert">{metrics.error}</p>}
+      {exportError && <p className="px-[12px] py-[6px] font-mono text-[9px] text-[#9b3f3f]" role="alert">{exportError}</p>}
+      <FilterBar
+        query={query}
+        onQueryChange={setQuery}
+        segment={segment}
+        onSegmentChange={setSegment}
+        statusCounts={statusCounts}
+        onExport={() => void handleExport()}
+      />
+      <FeedStatusBar paused={paused} onTogglePaused={togglePaused} onJumpToLatest={jumpToLatest} />
       <TransactionTable rows={rows} scrollRef={tableScrollRef} />
-      <span className="sr-only" aria-live="polite">{reviewCount} review transactions and {flaggedCount} flagged transactions</span>
+      <span className="sr-only" aria-live="polite">{statusCounts.review} review transactions and {statusCounts.flagged} flagged transactions</span>
     </div>
   )
 }

@@ -1,0 +1,123 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: underlock
+      POSTGRES_USER: underlock
+      POSTGRES_PASSWORD: underlock
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U underlock -d underlock"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  migrate:
+    build: .
+    command: ["uv", "run", "alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://underlock:underlock@postgres:5432/underlock
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+  seed:
+    build: .
+    command: ["uv", "run", "python", "-m", "api.seed"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://underlock:underlock@postgres:5432/underlock
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+  provision-demo-analyst:
+    build: .
+    command: ["uv", "run", "python", "scripts/provision_analyst_password.py"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://underlock:underlock@postgres:5432/underlock
+      SIMULATOR_ANALYST_CODE: ${SIMULATOR_ANALYST_CODE:-AN-8902}
+      SIMULATOR_ANALYST_PASSWORD: ${SIMULATOR_ANALYST_PASSWORD:?Set SIMULATOR_ANALYST_PASSWORD to a strong password}
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    restart: "no"
+  api:
+    build: .
+    command: ["uv", "run", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://underlock:underlock@postgres:5432/underlock
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY to a random secret of at least 32 characters}
+      JWT_ACCESS_TOKEN_MINUTES: ${JWT_ACCESS_TOKEN_MINUTES:-60}
+      API_CORS_ORIGINS: '${API_CORS_ORIGINS:-["http://localhost:3000","http://localhost:5173"]}'
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      provision-demo-analyst:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  worker:
+    build: .
+    command: ["uv", "run", "python", "-m", "worker.main"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://underlock:underlock@postgres:5432/underlock
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  simulator:
+    build: .
+    command:
+      - uv
+      - run
+      - python
+      - -m
+      - simulator
+      - --rate
+      - ${SIMULATOR_RATE:-5}
+      - --fraud-rate
+      - ${SIMULATOR_FRAUD_RATE:-0.10}
+      - --duration
+      - "0"
+      - --batch-size
+      - "5"
+    environment:
+      API_URL: http://api:8000
+      DATABASE_URL: postgresql+asyncpg://underlock:underlock@postgres:5432/underlock
+      REDIS_URL: redis://redis:6379/0
+      SIMULATOR_ANALYST_CODE: ${SIMULATOR_ANALYST_CODE:-AN-8902}
+      SIMULATOR_ANALYST_PASSWORD: ${SIMULATOR_ANALYST_PASSWORD:?Set SIMULATOR_ANALYST_PASSWORD to a strong password}
+    depends_on:
+      api:
+        condition: service_started
+      worker:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
